@@ -1,312 +1,476 @@
-/*
- This is the base example sketch for using the LeoPhi hardware version2 and up. 
- It can output via USB serial and Serial1(hardware USART) just use which one you need. 
- Also there is an I2C slave enabled version of this for an example how to use via I2C.
- There are a number of ways to calculate pH based on the E(electromagnetic potential) reading from our circuit.
- We will use a simple method, but recommend using temperature compensation maths for a much better results.
- A rolling average method is also implemented to filter the reading before display. Don't forget there are many pins
- broken out on the headers(I2C,Serial1,PWM,AnanlogIn). Unlike version 1 of the hardware all the status LED pins are now PWM enabled.
- though they still sink instead of source so keep that in mind!
- 
- Usage is simple as passing in commands to read pH, set calibration points, read with temp, etc...
- Feel free to adjust per usage, and please share so others can learn from any additions too!!
- LeoPhi can operate from (VCC) 2.65 to 5 so remember to set your reference voltage in math to this VCC.
- Sparky's Widgets 2013
- http://www.sparkyswidgets.com/portfolio-item/leophi-usb-arduino-ph-sensor/
+#include <Wire.h>
+#include <avr/eeprom.h>
 
- */
-#include <LiquidCrystal.h>
-#include <avr/eeprom.h> 
+long int _digitDelay;   // How much time spent per display during multiplexing.
+long int _digitOnDelay;   // How much on-time per display (used for dimming), i.e. it could be on only 40% of digitDelay
+long int _digitOffDelay;    // digitDelay minus digitOnDelay
+int _dutyCycle;   // The duty cycle (digitOnDelay/digitDelay, here in percent)
+long int _timerCounter;
+long int _fadeCounter = 0;
+long int _timerCounterOnEnd;
+long int _timerCounterOffEnd;
+int _timerPhase;
 
-int PHIN      =      A8;
-int GREENLED  =      10; //All Status LEDS on PWM, though they sink not source
-int BLUELED   =      11; 
-int REDLED    =       9; 
+enum {
+  I2C_CMD_GET_PH = 1,
+  I2C_CMD_SET_PH4 = 2,
+  I2C_CMD_SET_PH7 = 3,
+  I2C_CMD_SET_PH10 = 4,
+  I2C_CMD_SET_DEFAULT = 5,
+  I2C_CMD_SET_PULSE_ON = 6,
+  I2C_CMD_SET_GREEN_PULSE = 7,
+  I2C_CMD_SET_BLUE_PULSE = 8,
+  I2C_CMD_SET_RED_PULSE = 9,
+  I2C_CMD_SET_PULSE_OFF = 10,
+  GREEN_LED = 6,
+  BLUE_LED = 11,
+  RED_LED = 12
+};
 
-//LED fade effects
-int brightness =      0;
-int fadeAmount =      5;
+#define BUFFER_SIZE       16
+#define NUM_PASSES        20
+#define I2C_ADDR          0x5a
+#define TWI_FREQ_SETTING  400000L       // 400KHz for I2C
+#define CPU_FREQ          16000000L     // 16MHz
 
-//State machine base variables, do I really need two separate states, easier to code LED heartbeat and adc sample rate
-long previousMillis = 0;
-long adcMillis = 0;       
-int statusInterval = 1000;           // interval at which to blink or send updates(milliseconds)
-int adcReadInterval = 20;           // Our ADC read routine should be cycling at about ~50hz (20ms)
+// EEPROM trigger check
+#define Write_Check      0x1234
 
-//EEPROM trigger check
-#define Write_Check      0x1234 
-#define VERSION 0x0002
+int requestedCmd = 0;    // which command was requested (if any)
 
-const int adcMaxStep = 1023; //added this to allow for variable bit ranges (Remember Newer AVR adc architecture(e.g Atmega vs At90s) is meant for a divisor of 2^n-1!!!)
-const float vRef = 5.00; //Set our voltage reference (what is out Voltage at the Vin (+) of the ADC in this case an atmega32u4)
-const float opampGain = 5.25; //what is our Op-Amps gain (stage 1)
+uint8_t i2cResponse[2];  // array to store response
+int i2cResponseLen = 0;  // response length
 
-//Rolling average this should act as a digital filter (IE smoothing)
-const int numPasses = 200; //Larger number = slower response but greater smoothing effect
+volatile uint32_t result[BUFFER_SIZE];
+volatile int i = 0;
+volatile uint32_t sum = 0;
 
-int passes[numPasses];    //Our storage array
-int passIndex = 0;          //what pass are we on? this one
-long total = 0;              //running total
-int pHSmooth = 0;           //Our smoothed pHRaw number
+// LED fade effects
+unsigned long lastBlink;
+uint8_t brightness = 0;
+uint8_t fadeAmount = 2.55;
+uint8_t fadeInterval = 30; // interval at which to change led brightness
 
-//pH calc globals
-float milliVolts, pH; //using floats will transmit as 4 bytes over I2C
+// smoothing
+int passes[NUM_PASSES]; // Our storage array
+uint8_t passIndex = 0;  // what pass are we on? this one
+long total = 0;         // running total
 
-//Continuous reading flag
-bool continousFlag,statusGFlag;
+int pHRaw;
+int pHSmooth = 0;       // Our smoothed pHRaw number
+int intPh = 0;          // Our pH float as an int with the decimal moved right 2 places
 
-//Our parameter, for ease of use and eeprom access lets use a struct
-struct parameters_T
-{
-  unsigned int WriteCheck;
-  int pH7Cal, pH4Cal,pH10Cal;
-  bool continous,statusLEDG;
-  float pHStep;
-} 
-params;
+float temp;
+float miliVolts;
+float pH;
 
-void setup()  
-{
-  pinMode(GREENLED, OUTPUT);
-  pinMode(REDLED, OUTPUT);
-  pinMode(BLUELED, OUTPUT);
-  pinMode(4, OUTPUT);
-  digitalWrite(REDLED, HIGH);
-  digitalWrite(BLUELED, HIGH);
-  digitalWrite(GREENLED, HIGH);
-  pinMode(PHIN, INPUT);
-  //Serial1.begin(57600); //Enable basic serial commands in base version
-  eeprom_read_block(&params, (void *)0, sizeof(params));
-  continousFlag = params.continous;
-  statusGFlag = params.statusLEDG;
-  if (params.WriteCheck != Write_Check){
-    reset_Params();
-  }
-  sendSerialStatusInfo('I');
-  // initialize smoothing variables to 0: 
-  for (int thisPass = 0; thisPass < numPasses; thisPass++)
-    passes[thisPass] = 0;
+unsigned long lastCalc;
+uint8_t calcInterval = 30; // interval at which to calculate the pH
 
+// Our parameter, for ease of use and eeprom access lets use a struct
+struct parameters_T {
+    unsigned int WriteCheck;
+    int pH7Cal, pH4Cal, pH10Cal, statusColor;
+    bool statusPulse;
+    float pHStep;
+} params;
+
+void resetParams(void) {
+  // check if we're not already defaulted so a runaway I2C call to reset doesn't burn up our eeprom
+  //if (params.WriteCheck != Write_Check || !params.statusPulse || params.statusColor != GREEN_LED || params.pH7Cal != 2048
+   //   || params.pH4Cal != 1286 || params.pH10Cal != 2810 || params.pHStep != 59.16) {
+    //Restore to default set of parameters!
+    params.WriteCheck = Write_Check;
+    params.statusPulse = true;
+    params.statusColor = GREEN_LED;
+    params.pH7Cal = 2048; //assume ideal probe and amp conditions 1/2 of 4096
+    params.pH4Cal = 1286; //using ideal probe slope we end up this many 12bit units away on the 4 scale
+    params.pH10Cal = 2810; //using ideal probe slope we end up this many 12bit units away on the 10 scale
+    params.pHStep = 59.16; //ideal probe slope
+    eeprom_write_block(&params, (void *) 0, sizeof(params)); //write these settings back to eeprom
+  //}
 }
 
-void loop()
+void updDelay() {
+  // On-time for each display is total time spent per digit times the duty cycle. The
+  // off-time is the rest of the cycle for the given display.
+
+  long int temp = _digitDelay;    // Stored into long int since temporary variable gets larger than 32767
+  temp *= _dutyCycle;     // Multiplication in this way to prevent multiplying two "shorter" ints.
+  temp /= 100;        // Division after multiplication to minimize round-off errors.
+  _digitOnDelay = temp;
+  _digitOffDelay = _digitDelay - _digitOnDelay;
+
+  cli();
+  _timerCounterOnEnd=(_digitOnDelay/16)-1;
+  _timerCounterOffEnd=(_digitOffDelay/16)-1;
+  if(_digitOnDelay==0) _timerCounterOnEnd=0;
+  if(_digitOffDelay==0) _timerCounterOffEnd=0;
+  _timerCounter=0;
+  sei();
+}
+
+void setDutyCycle(int dc){
+  _dutyCycle=dc;
+  updDelay();
+}
+
+void setDigitDelay(long int delay){
+  _digitDelay=delay;
+  updDelay();
+}
+
+void setRefreshRate(int freq) {
+  long int period = 1000000L / freq;
+  long int digitDelay = period/1;
+  setDigitDelay(digitDelay);
+}
+
+void setupADC(uint8_t channel, int frequency) {
+  cli();
+  ADMUX = channel | _BV(REFS0);
+  ADCSRA |= _BV(ADPS2) | _BV(ADPS1) | _BV(ADPS0) | _BV(ADATE) | _BV(ADIE);
+  ADCSRB |= _BV(ADTS2) | _BV(ADTS0);  //Compare Match B on counter 1
+  TCCR1A = _BV(COM1B1);
+  TCCR1B = _BV(CS11) | _BV(CS10) | _BV(WGM12);
+  uint32_t clock = 250000;
+  uint16_t counts = clock / (BUFFER_SIZE * frequency);
+  OCR1B = counts;
+  TIMSK1 = _BV(OCIE1B);
+  ADCSRA |= _BV(ADEN) | _BV(ADSC);
+  sei();
+}
+
+void setupFadeTimer()
 {
+  cli();
+  TCCR3A = 0;
+  TCCR3B = 0;
+  TCNT3 = 0;
+  OCR3A = 3;
+  TCCR3B = ((1 << WGM32)|(1 << CS31));
+  TIMSK3 = (1 << OCIE3A);
+  sei();
+  updDelay();
+  _timerCounter = 0;
+}
+
+ISR(ADC_vect) {
+  result[i] = ADC;
+  i = ++i & (BUFFER_SIZE - 1);
+
+  for (uint8_t j = 0; j < BUFFER_SIZE; j++) {
+    sum += result[j];
+  }
+
+  if (i == 0) {
+    pHRaw = sum >> 2;
+  }
+
+  sum = 0;
+  TCNT1 = 0;
+}
+
+void calcpH() {
+  if (millis() - lastCalc > calcInterval || intPh == 0) {
+    lastCalc = millis();
+    miliVolts = (((float) pHSmooth / 4096) * 5) * 1000;
+    temp = ((((5 * (float) params.pH7Cal) / 4096) * 1000) - miliVolts) / 5.25; //5.25 is the gain of our amp stage we need to remove it
+    pH = 7 - (temp / params.pHStep);
+    intPh = pH * 100;
+  }
+}
+
+void requestEvent() {
+  Wire.write(i2cResponse, i2cResponseLen);
+  requestedCmd = 0;
+}
+
+// function that executes when master sends data (begin-end transmission)
+// this function is registered as an event, see setup()
+void receiveEvent(int howMany) {
+  if (Wire.available()) {
+    requestedCmd = Wire.read(); // receive first byte - command assumed
+  }
+}
+
+void smoothPh() {
   //Our smoothing portion
   //subtract the last pass
-  unsigned long currentMillis = millis();
+  total = total - passes[passIndex];
 
-if(currentMillis - adcMillis > adcReadInterval)
-  {
-    // save the last time you blinked the LED 
-    adcMillis = currentMillis;
+  //grab our pHRaw this should pretty much always be updated due to our Oversample ISR
+  //and place it in our passes array this mimics an analogRead on a pin
+  passes[passIndex] = pHRaw;
+  total = total + passes[passIndex];
+  passIndex = passIndex + 1;
 
-    total = total - passes[passIndex];
-    //grab our pHRaw this should pretty much always be updated due to our Oversample ISR
-    //and place it in our passes array this mimics an analogRead on a pin
-    digitalWrite(4, HIGH); 
-    passes[passIndex] = smoothADCRead(PHIN);
-    digitalWrite(4, LOW); //these will show our sampling fQ checking with scope!
-    total = total + passes[passIndex];
-    passIndex = passIndex + 1;
-    //Now handle end of array and make our rolling average portion
-    if(passIndex >= numPasses)
-    {
+  //Now handle end of array and make our rolling average portion
+  if (passIndex >= NUM_PASSES) {
     passIndex = 0;
-    }
-    
-    pHSmooth = total/numPasses;
-
-    //This is for our status LED heartbeats display however needed
-    if(statusGFlag)
-      {
-        analogWrite(BLUELED, brightness);    
-        // change the brightness for next time through the loop:
-        brightness = brightness + fadeAmount;
-        // reverse the direction of the fading at the ends of the fade: 
-        if (brightness == 0 || brightness == 255) {
-          fadeAmount = -fadeAmount ; 
-        }
-      }
-
   }
 
+  pHSmooth = total / NUM_PASSES;
+}
 
-  if(Serial.available() ) 
-  {
-    String msgIN = "";
-    int msgLength = 18;
-    int msgCount = 0;
-    char c;
-    while(Serial.available() && msgCount < msgLength)
+void ledPulse() {
+  _timerCounter++;
+
+  // Finished with on-part. Turn off digit, and switch to the off-phase (_timerPhase=0)
+  if ((_timerCounter >= _timerCounterOnEnd) && (_timerPhase == 1)) {
+    _timerCounter = 0;
+    _timerPhase = 0;
+    digitalWrite(params.statusColor, HIGH);
+  }
+
+  // Finished with the off-part. Switch to next digit and turn it on.
+  if ((_timerCounter >= _timerCounterOffEnd) && (_timerPhase == 0)) {
+    _timerCounter = 0;
+    _timerPhase = 1;
+    digitalWrite(params.statusColor, LOW);
+  }
+
+  if (millis() - lastBlink > fadeInterval) {
+    lastBlink = millis();
+    // change the brightness for next time through the loop:
+    brightness = brightness + fadeAmount;
+    setDutyCycle(brightness);
+
+    if (brightness == 0 || brightness == 100)
     {
-     c = Serial.read();  
-     msgIN += c;
-     msgCount++;// just a little bit of string length protection
-     }
-     processMessage(msgIN);
+      fadeAmount = -fadeAmount;
+   }
   }
+}
 
+void getPhResponse() {
+  requestedCmd = 0;
+  i2cResponseLen = 0;
   calcpH();
+  i2cResponse[i2cResponseLen++] = intPh >> 8;
+  i2cResponse[i2cResponseLen++] = intPh & 0xff;
+}
 
-  if(currentMillis - previousMillis > statusInterval)
+void setPH4Response() {
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  if (params.pH4Cal != pHSmooth) {
+    params.pH4Cal = pHSmooth;
+    //RefVoltage * our deltaRawpH / 12bit steps *mV in V / OP-Amp gain /pH step difference 7-4
+    params.pHStep = ((((5 * (float) (params.pH7Cal - params.pH4Cal)) / 4096) * 1000) / 5.25) / 3;
+    eeprom_write_block(&params, (void *) 0, sizeof(params));
+  }
+  i2cResponse[i2cResponseLen++] = params.pH4Cal >> 8;
+  i2cResponse[i2cResponseLen++] = params.pH4Cal & 0xff;
+  Serial.print("ph4 calibrated to ");
+  Serial.println(params.pH4Cal);
+}
+
+void setPH7Response() {
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  if (params.pH7Cal != pHSmooth) {
+    params.pH7Cal = pHSmooth;
+    eeprom_write_block(&params, (void *) 0, sizeof(params));
+  }
+  i2cResponse[i2cResponseLen++] = params.pH7Cal >> 8;
+  i2cResponse[i2cResponseLen++] = params.pH7Cal & 0xff;
+  Serial.print("pH7 calibrated to ");
+  Serial.println(params.pH7Cal);
+}
+
+void setPH10Response() {
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  if (params.pH10Cal != pHSmooth) {
+    params.pH10Cal = pHSmooth;
+    //RefVoltage * our deltaRawpH / 12bit steps *mV in V / OP-Amp gain /pH step difference 10-7
+    params.pHStep = ((((5 * (float) (params.pH10Cal - params.pH7Cal)) / 4096) * 1000) / 5.25) / 3;
+    eeprom_write_block(&params, (void *) 0, sizeof(params));
+  }
+  i2cResponse[i2cResponseLen++] = params.pH10Cal >> 8;
+  i2cResponse[i2cResponseLen++] = params.pH10Cal & 0xff;
+  Serial.print("pH10 calibrated to ");
+  Serial.println(params.pH10Cal);
+}
+
+void setDefaultResponse() {
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  Serial.println("Reseting to default settings");
+  resetParams();
+  i2cResponse[i2cResponseLen++] = true >> 8;
+}
+
+void setpulseOnResponse()
+{
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  if(!params.statusPulse)
   {
-    // save the last time you blinked the LED 
-    previousMillis = currentMillis;   
-    
-    if(continousFlag)
-    {
-     digitalWrite(REDLED,LOW);
-     sendSerialStatusInfo('S');
+    Serial.println("Turning status pulse on");
+    params.statusPulse = true;
+    eeprom_write_block(&params, (void *) 0, sizeof(params));
+  }
+  i2cResponse[i2cResponseLen++] = true >> 8;
+}
+
+void setpulseOffResponse()
+{
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  if(params.statusPulse)
+  {
+    Serial.println("Turning status pulse off");
+    params.statusPulse = false;
+    eeprom_write_block(&params, (void *) 0, sizeof(params));
+  }
+  i2cResponse[i2cResponseLen++] = true >> 8;
+}
+
+void setGreenPulseResponse()
+{
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  if(params.statusColor != GREEN_LED)
+  {
+    Serial.println("Setting status led to GREEN");
+    params.statusColor = GREEN_LED;
+    eeprom_write_block(&params, (void *) 0, sizeof(params));
+  }
+  i2cResponse[i2cResponseLen++] = true >> 8;
+}
+
+void setBluePulseResponse()
+{
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  if(params.statusColor != BLUE_LED)
+  {
+    Serial.println("Setting status led to BLUE");
+    params.statusColor = BLUE_LED;
+    eeprom_write_block(&params, (void *) 0, sizeof(params));
+  }
+  i2cResponse[i2cResponseLen++] = true >> 8;
+}
+
+void setRedPulseResponse()
+{
+  requestedCmd = 255;
+  i2cResponseLen = 0;
+  if(params.statusColor != RED_LED)
+  {
+    Serial.println("Setting status led to RED");
+    params.statusColor = RED_LED;
+    eeprom_write_block(&params, (void *) 0, sizeof(params));
+  }
+  i2cResponse[i2cResponseLen++] = true >> 8;
+}
+
+void setI2cResponse() {
+  if (requestedCmd > 0 && requestedCmd < 255) {
+    switch (requestedCmd) {
+
+      case I2C_CMD_GET_PH:
+        getPhResponse();
+        break;
+
+      case I2C_CMD_SET_PH4:
+        setPH4Response();
+        break;
+
+      case I2C_CMD_SET_PH7:
+        setPH7Response();
+        break;
+
+      case I2C_CMD_SET_PH10:
+        setPH10Response();
+        break;
+
+      case I2C_CMD_SET_DEFAULT:
+        setDefaultResponse();
+        break;
+
+      case I2C_CMD_SET_PULSE_ON:
+        setpulseOnResponse();
+        break;
+
+      case I2C_CMD_SET_PULSE_OFF:
+        setpulseOffResponse();
+        break;
+
+      case I2C_CMD_SET_GREEN_PULSE:
+        setGreenPulseResponse();
+        break;
+
+      case I2C_CMD_SET_BLUE_PULSE:
+        setBluePulseResponse();
+        break;
+
+      case I2C_CMD_SET_RED_PULSE:
+        setRedPulseResponse();
+        break;
+
+      default:
+        requestedCmd = 0;
     }
-    digitalWrite(REDLED,HIGH); //we place here in the odd case if you exit C mode while LED is on
+  }
+  // just set the response with the pH value
+  else if(requestedCmd != 255){
+    getPhResponse();
   }
 }
 
-void calcpH()
-{
- float temp = ((((vRef*(float)params.pH7Cal)/adcMaxStep)*1000)- calcMilliVolts(pHSmooth))/opampGain;
- pH = 7-(temp/params.pHStep);
-}
+void setup() {
+  _digitDelay = 0;
+  _digitOnDelay = 0;
+  _digitOffDelay = 0;
+  _dutyCycle = 100;
 
-float calcMilliVolts(int numToCalc)
-{
- float calcMilliVolts = (((float)numToCalc/adcMaxStep)*vRef)*1000; //pH smooth is our rolling average mine as well use it
- return calcMilliVolts;
-}
+  _timerPhase = 1;
+  _timerCounterOnEnd = 0;
+  _timerCounterOffEnd = 0;
 
-int smoothADCRead(int whichPin)
-{
-  //lets just take a reading and drop it, this should eliminate any ADC multiplexer issues
-  int throwAway = analogRead(whichPin);
-  int smoothADCRead = analogRead(whichPin);
-  return smoothADCRead;
-}
+  setupADC(0, 100);
+  setupFadeTimer();
 
-void sendSerialStatusInfo(char charStatusInfo)
-{
-  if(charStatusInfo == 'S')
-  {
-    Serial.print("pHRaw: ");
-    Serial.print(pHSmooth);
-    Serial.print(" | ");
-    Serial.print("pH: ");
-    Serial.print(pH);
-    Serial.print(" | ");
-    Serial.print("Millivolts: ");
-    Serial.println(calcMilliVolts(pHSmooth));
+  setRefreshRate(150);
+
+  //eeprom_read_block(&params, (void *) 0, sizeof(params));
+  if (params.WriteCheck != Write_Check) {
+    resetParams();
   }
-  if(charStatusInfo == 'I')
-  {
-   Serial.print("LeoPhi Info: Firmware Ver ");
-   Serial.println(VERSION);
-   Serial.print("pH 7 cal: ");
-   Serial.print(params.pH7Cal);
-   Serial.print(" | ");
-   Serial.print("pH 4 cal: ");
-   Serial.print(params.pH4Cal);
-   Serial.print(" | ");
-   Serial.print("pH 10 cal: ");
-   Serial.print(params.pH10Cal);
-   Serial.print(" | ");
-   Serial.print("pH probe slope: ");
-   Serial.println(params.pHStep);
+  Serial.begin(57600);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(BLUE_LED, HIGH);
+  digitalWrite(RED_LED, HIGH);
+
+  // >> starting i2c
+  TWBR = ((CPU_FREQ / TWI_FREQ_SETTING) - 16) / 2;
+  Wire.begin(I2C_ADDR);
+  Wire.onRequest(requestEvent);
+  Wire.onReceive(receiveEvent);
+
+  // initialize smoothing variables to 0:
+  for (uint8_t thisPass = 0; thisPass < NUM_PASSES; thisPass++) {
+    passes[thisPass] = 0;
   }
 }
 
-//FIXME: re factor, and don't use Strings bah, it works for now... no long inputs!
-void processMessage(String msg)
-{
-  if(msg.startsWith("L"))
-  {
-    if (msg.substring(2,1) ==  "0") 
-    {
-     //Status led visual indication of a working unit on powerup 0 means off
-     statusGFlag = false;
-     digitalWrite(BLUELED, HIGH);
-     Serial.println("Status led off");
-     params.statusLEDG = statusGFlag;
-     eeprom_write_block(&params, (void *)0, sizeof(params)); 
-    }
-    if (msg.substring(2,1) ==  "1") 
-    {
-     //Status led visual indication of a working unit on powerup 0 means off
-     statusGFlag = true;
-     Serial.println("Status led on");
-     params.statusLEDG = statusGFlag;
-     eeprom_write_block(&params, (void *)0, sizeof(params));  
-    }
-     
-  }
-  if(msg.startsWith("R"))
-  {
-    //take a pH reading
-   calcpH();
-   Serial.println(pH); 
-  }
-  if(msg.startsWith("C"))
-  {
-     continousFlag = true;
-     Serial.println("Continuous Reading On");
-     params.continous = continousFlag;
-     eeprom_write_block(&params, (void *)0, sizeof(params));
-  }
-  if(msg.startsWith("E"))
-  {
-   //exit continuous reading mode
-     continousFlag = false;
-     Serial.println("Continuous Reading Off");
-     params.continous = continousFlag;
-     eeprom_write_block(&params, (void *)0, sizeof(params)); 
-  }
-  if(msg.startsWith("S"))
-  {
-   //Calibrate to pH7 solution, center on this for zero
-   Serial.println("Calibrate 7");
-   params.pH7Cal = pHSmooth;
-   eeprom_write_block(&params, (void *)0, sizeof(params));
-  }
-  if(msg.startsWith("F"))
-  {
-   //calibrate to pH4 solution, recalculate our slope to account for probe
-   Serial.println("Calibrate 4");
-   params.pH4Cal = pHSmooth;
-   //RefVoltage * our deltaRawpH / 10bit steps *mV in V / OP-Amp gain /pH step difference 7-4
-   params.pHStep = ((((vRef*(float)(params.pH7Cal - params.pH4Cal))/1024)*1000)/opampGain)/3;
-   eeprom_write_block(&params, (void *)0, sizeof(params));
-  }
-  if(msg.startsWith("T"))
-  {
-   //calibrate to pH10 solution, recalculate our slope to account for probe 
-   Serial.println("Calibrate 10");
-   params.pH10Cal = pHSmooth;
-   //RefVoltage * our deltaRawpH / 10bit steps *mV in V / OP-Amp gain /pH step difference 10-7
-   params.pHStep = ((((vRef*(float)(params.pH10Cal - params.pH7Cal))/1024)*1000)/opampGain)/3;
-   eeprom_write_block(&params, (void *)0, sizeof(params));
-  }
-    if(msg.startsWith("I"))
-  {
-   //Lets read in our parameters and spit out the info! 
-   eeprom_read_block(&params, (void *)0, sizeof(params));
-   sendSerialStatusInfo('I');
-  }
-    if(msg.startsWith("X"))
-  {
-    //restore to default settings
-    Serial.println("Reseting to default settings");
-    reset_Params();
-  }
+void loop() {
+  smoothPh();
+  setI2cResponse();
 }
 
-void reset_Params(void)
+ISR(TIMER3_COMPA_vect)
 {
-  //Restore to default set of parameters!
-  params.WriteCheck = Write_Check;
-  params.statusLEDG = true;
-  params.continous = false; //toggle continuous readings
-  params.pH7Cal = 512; //assume ideal probe and amp conditions 1/2 of 1024
-  params.pH4Cal = 382; //using ideal probe slope we end up this many 10bit units away on the 4 scale
-  params.pH10Cal = 890;//using ideal probe slope we end up this many 10bit units away on the 10 scale
-  params.pHStep = 59.16;//ideal probe slope
-  eeprom_write_block(&params, (void *)0, sizeof(params)); //write these settings back to eeprom
+  ledPulse();
+}
+
+ISR(TIMER1_COMPB_vect) {
+
 }
 
